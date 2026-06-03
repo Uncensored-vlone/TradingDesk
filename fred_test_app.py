@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import json
 import os
 import random
 import secrets
@@ -16,11 +17,11 @@ import streamlit as st
 
 FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 REQUEST_TIMEOUT = 12
-CACHE_TTL = 3600
 DB_PATH = os.getenv("FRED_CACHE_DB", "output/fred_cache.db")
 PBKDF2_ITERATIONS = 260000
 FRED_MAX_RETRIES = 3
 FRED_BACKOFF_BASE = 1.0
+ADMIN_PASSWORD = "HEQ2024"
 
 SERIES_MAP: Dict[str, str] = {
     "UNRATE": "US Unemployment Rate",
@@ -88,14 +89,7 @@ def utc_now() -> str:
 
 
 def init_state() -> None:
-    defaults = {
-        "trade_logs": [],
-        "alerts": [],
-        "historical_scores": [],
-        "last_snapshot_date": None,
-        "admin_unlocked": False,
-    }
-    for k, v in defaults.items():
+    for k, v in {"trade_logs": [], "alerts": [], "historical_scores": [], "last_snapshot_date": None, "admin_unlocked": False}.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
@@ -104,8 +98,7 @@ def hash_password(password: str, salt: Optional[str] = None, iterations: int = P
     if salt is None:
         salt = secrets.token_hex(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations)
-    b64 = base64.b64encode(dk).decode("ascii").strip()
-    return f"pbkdf2_sha256${iterations}${salt}${b64}"
+    return f"pbkdf2_sha256${iterations}${salt}${base64.b64encode(dk).decode('ascii').strip()}"
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
@@ -115,14 +108,13 @@ def verify_password(password: str, stored_hash: str) -> bool:
         algorithm, iterations, salt, _ = stored_hash.split("$", 3)
         if algorithm != "pbkdf2_sha256":
             return False
-        candidate = hash_password(password, salt=salt, iterations=int(iterations))
-        return hmac.compare_digest(candidate, stored_hash)
+        return hmac.compare_digest(hash_password(password, salt=salt, iterations=int(iterations)), stored_hash)
     except Exception:
         return False
 
 
 def authenticate_admin(entered_password: str) -> bool:
-    return entered_password == "HEQ2024"
+    return entered_password == ADMIN_PASSWORD
 
 
 def ensure_output_dir() -> None:
@@ -159,10 +151,7 @@ def init_db() -> None:
 def log_request(series_id: str, status_code: Optional[int], source: str, retries: int, success: bool) -> None:
     conn = get_db()
     try:
-        conn.execute(
-            "INSERT INTO request_log (ts, series_id, status_code, source, retries, success) VALUES (?, ?, ?, ?, ?, ?)",
-            (utc_now(), series_id, status_code, source, retries, 1 if success else 0),
-        )
+        conn.execute("INSERT INTO request_log (ts, series_id, status_code, source, retries, success) VALUES (?, ?, ?, ?, ?, ?)", (utc_now(), series_id, status_code, source, retries, 1 if success else 0))
         conn.commit()
     finally:
         conn.close()
@@ -174,7 +163,7 @@ def save_cache(series_id: str, payload: Dict[str, Any]) -> None:
         conn.execute(
             "INSERT INTO fred_cache (series_id, payload, updated_at) VALUES (?, ?, ?) "
             "ON CONFLICT(series_id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at",
-            (series_id, pd.Series(payload).to_json(), utc_now()),
+            (series_id, json.dumps(payload), utc_now()),
         )
         conn.commit()
     finally:
@@ -185,9 +174,7 @@ def load_cache(series_id: str) -> Optional[Dict[str, Any]]:
     conn = get_db()
     try:
         row = conn.execute("SELECT payload FROM fred_cache WHERE series_id=?", (series_id,)).fetchone()
-        if not row:
-            return None
-        return pd.read_json(row["payload"], typ="series").to_dict()
+        return None if not row else json.loads(row["payload"])
     finally:
         conn.close()
 
@@ -221,13 +208,7 @@ def load_snapshots() -> pd.DataFrame:
 def fetch_fred_series_live(series_id: str, api_key: str) -> Dict[str, Any]:
     if not api_key:
         raise RuntimeError("FRED_API_KEY is missing.")
-    params = {
-        "series_id": series_id,
-        "api_key": api_key,
-        "file_type": "json",
-        "sort_order": "desc",
-        "limit": 2,
-    }
+    params = {"series_id": series_id, "api_key": api_key, "file_type": "json", "sort_order": "desc", "limit": 2}
     session = get_http_session()
     last_error = None
     for attempt in range(FRED_MAX_RETRIES):
@@ -291,17 +272,7 @@ def latest_reading(series_id: str, api_key: str) -> Optional[SeriesReading]:
     previous = float(previous_row["value"]) if previous_row is not None and pd.notna(previous_row["value"]) else None
     change = None if current is None or previous is None else current - previous
     pct_change = None if current is None or previous is None or previous == 0 else (change / abs(previous)) * 100.0
-    return SeriesReading(
-        series_id=series_id,
-        name=SERIES_MAP[series_id],
-        current=current,
-        previous=previous,
-        change=change,
-        pct_change=pct_change,
-        trend=trend_label(change),
-        last_update=str(current_row["date"].date()),
-        stale=stale,
-    )
+    return SeriesReading(series_id, SERIES_MAP[series_id], current, previous, change, pct_change, trend_label(change), str(current_row["date"].date()), stale)
 
 
 def fetch_basket(basket: List[str], api_key: str) -> List[SeriesReading]:

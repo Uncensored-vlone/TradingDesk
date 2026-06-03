@@ -8,7 +8,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import requests
@@ -19,7 +19,7 @@ REQUEST_TIMEOUT = 12
 CACHE_TTL = 3600
 DB_PATH = os.getenv("FRED_CACHE_DB", "output/fred_cache.db")
 PBKDF2_ITERATIONS = 260000
-FRED_MAX_RETRIES = 4
+FRED_MAX_RETRIES = 3
 FRED_BACKOFF_BASE = 1.0
 
 SERIES_MAP: Dict[str, str] = {
@@ -94,14 +94,13 @@ def init_state() -> None:
         "historical_scores": [],
         "last_snapshot_date": None,
         "admin_unlocked": False,
-        "api_log": [],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 
-def pbkdf2_hash_password(password: str, salt: Optional[str] = None, iterations: int = PBKDF2_ITERATIONS) -> str:
+def hash_password(password: str, salt: Optional[str] = None, iterations: int = PBKDF2_ITERATIONS) -> str:
     if salt is None:
         salt = secrets.token_hex(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations)
@@ -109,22 +108,21 @@ def pbkdf2_hash_password(password: str, salt: Optional[str] = None, iterations: 
     return f"pbkdf2_sha256${iterations}${salt}${b64}"
 
 
-def pbkdf2_verify_password(password: str, password_hash: str) -> bool:
+def verify_password(password: str, stored_hash: str) -> bool:
     try:
-        algorithm, iterations, salt, _ = password_hash.split("$", 3)
+        if (stored_hash or "").count("$") != 3:
+            return False
+        algorithm, iterations, salt, _ = stored_hash.split("$", 3)
         if algorithm != "pbkdf2_sha256":
             return False
-        candidate = pbkdf2_hash_password(password, salt=salt, iterations=int(iterations))
-        return hmac.compare_digest(candidate, password_hash)
+        candidate = hash_password(password, salt=salt, iterations=int(iterations))
+        return hmac.compare_digest(candidate, stored_hash)
     except Exception:
         return False
 
 
 def authenticate_admin(entered_password: str) -> bool:
-    password_hash = os.getenv("ADMIN_PASSWORD_HASH", "")
-    if not password_hash:
-        return False
-    return pbkdf2_verify_password(entered_password, password_hash)
+    return entered_password == "HEQ2024"
 
 
 def ensure_output_dir() -> None:
@@ -150,42 +148,9 @@ def get_db() -> sqlite3.Connection:
 def init_db() -> None:
     conn = get_db()
     try:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS fred_cache (
-                series_id TEXT PRIMARY KEY,
-                payload TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS snapshots (
-                snapshot_date TEXT PRIMARY KEY,
-                usd REAL,
-                jpy REAL,
-                gbp REAL,
-                eur REAL,
-                created_at TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS request_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                series_id TEXT NOT NULL,
-                status_code INTEGER,
-                source TEXT NOT NULL,
-                retries INTEGER NOT NULL,
-                success INTEGER NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS admin_audit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                action TEXT NOT NULL,
-                details TEXT
-            )
-        """)
+        conn.execute("CREATE TABLE IF NOT EXISTS fred_cache (series_id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS snapshots (snapshot_date TEXT PRIMARY KEY, usd REAL, jpy REAL, gbp REAL, eur REAL, created_at TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS request_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, series_id TEXT NOT NULL, status_code INTEGER, source TEXT NOT NULL, retries INTEGER NOT NULL, success INTEGER NOT NULL)")
         conn.commit()
     finally:
         conn.close()
@@ -246,13 +211,13 @@ def load_snapshots() -> pd.DataFrame:
     try:
         rows = conn.execute("SELECT snapshot_date, usd, jpy, gbp, eur FROM snapshots ORDER BY snapshot_date").fetchall()
         if not rows:
-            return pd.DataFrame(columns=["snapshot_date", "usd", "jpy", "gbp", "eur"])
-        return pd.DataFrame([dict(r) for r in rows])
+            return pd.DataFrame(columns=["date", "USD", "JPY", "GBP", "EUR"])
+        df = pd.DataFrame([dict(r) for r in rows])
+        return df.rename(columns={"snapshot_date": "date", "usd": "USD", "jpy": "JPY", "gbp": "GBP", "eur": "EUR"})
     finally:
         conn.close()
 
 
-@st.cache_data(ttl=CACHE_TTL)
 def fetch_fred_series_live(series_id: str, api_key: str) -> Dict[str, Any]:
     if not api_key:
         raise RuntimeError("FRED_API_KEY is missing.")
@@ -268,19 +233,17 @@ def fetch_fred_series_live(series_id: str, api_key: str) -> Dict[str, Any]:
     for attempt in range(FRED_MAX_RETRIES):
         try:
             resp = session.get(FRED_BASE_URL, params=params, timeout=REQUEST_TIMEOUT)
-            status = resp.status_code
-            if status == 429:
+            if resp.status_code == 429:
                 raise RuntimeError("429")
             resp.raise_for_status()
             data = resp.json()
             save_cache(series_id, data)
-            log_request(series_id, status, "live", attempt, True)
+            log_request(series_id, resp.status_code, "live", attempt, True)
             return data
         except Exception as e:
             last_error = e
-            wait = FRED_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 0.25)
             if attempt < FRED_MAX_RETRIES - 1:
-                time.sleep(wait)
+                time.sleep(FRED_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 0.25))
     cached = load_cache(series_id)
     if cached:
         log_request(series_id, 0, "stale_cache", FRED_MAX_RETRIES, True)
@@ -297,8 +260,7 @@ def observations_to_df(payload: Dict[str, Any]) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["value"] = df["value"].replace(".", pd.NA)
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df = df.dropna(subset=["date", "value"]).sort_values("date", ascending=False)
-    return df
+    return df.dropna(subset=["date", "value"]).sort_values("date", ascending=False)
 
 
 def trend_label(change: Optional[float]) -> str:
@@ -346,9 +308,9 @@ def fetch_basket(basket: List[str], api_key: str) -> List[SeriesReading]:
     out: List[SeriesReading] = []
     for sid in basket:
         try:
-            r = latest_reading(sid, api_key)
-            if r is not None:
-                out.append(r)
+            reading = latest_reading(sid, api_key)
+            if reading is not None:
+                out.append(reading)
         except Exception as e:
             st.warning(f"{SERIES_MAP.get(sid, sid)} skipped: {e}")
     return out
@@ -356,48 +318,32 @@ def fetch_basket(basket: List[str], api_key: str) -> List[SeriesReading]:
 
 def score_series(r: SeriesReading) -> float:
     if r.series_id in {"UNRATE", "LRHUTTTTGBM156S", "LRHUTTTTEZM156S", "LRUN64TTJPM156S"}:
-        if r.change is None:
-            return 50.0
-        return 90.0 if r.change < 0 else 10.0 if r.change > 0 else 50.0
+        return 50.0 if r.change is None else (90.0 if r.change < 0 else 10.0 if r.change > 0 else 50.0)
     if r.series_id in {"FEDFUNDS", "DGS10", "IRSTCI01JPM156N", "IRLTLT01GBM156N", "IRSTCI01EZM156N"}:
-        if r.change is None:
-            return 50.0
-        return 80.0 if r.change > 0 else 20.0 if r.change < 0 else 50.0
+        return 50.0 if r.change is None else (80.0 if r.change > 0 else 20.0 if r.change < 0 else 50.0)
     if r.series_id in {"GDP", "JPNRGDPEXP", "UKRGDPEXP", "CLVMNACSCAB1GQEA19"}:
-        if r.change is None:
-            return 50.0
-        return 75.0 if r.change > 0 else 25.0 if r.change < 0 else 50.0
+        return 50.0 if r.change is None else (75.0 if r.change > 0 else 25.0 if r.change < 0 else 50.0)
     if r.current is None:
         return 50.0
-    if 2.0 <= r.current <= 3.5:
-        return 80.0
-    if r.current < 2.0:
-        return 45.0
-    return max(20.0, 75.0 - (r.current - 3.5) * 10.0)
+    return 80.0 if 2.0 <= r.current <= 3.5 else 45.0 if r.current < 2.0 else max(20.0, 75.0 - (r.current - 3.5) * 10.0)
 
 
 def currency_score(currency: str, readings: List[SeriesReading]) -> MacroScoreResult:
-    if currency == "USD":
-        weights = DEFAULT_WEIGHTS
-    else:
-        weights = {sid: 1.0 / max(1, len(CURRENCY_BASKETS[currency])) for sid in CURRENCY_BASKETS[currency]}
-    components: Dict[str, float] = {}
+    weights = DEFAULT_WEIGHTS if currency == "USD" else {sid: 1.0 / len(CURRENCY_BASKETS[currency]) for sid in CURRENCY_BASKETS[currency]}
     weighted_sum = 0.0
     weight_sum = 0.0
     stale_count = 0
-    missing_count = 0
+    components: Dict[str, float] = {}
     for r in readings:
-        s = score_series(r)
         w = float(weights.get(r.series_id, 0.0))
         if w > 0:
+            s = score_series(r)
             components[r.series_id] = s
             weighted_sum += s * w
             weight_sum += w
             if r.stale:
                 stale_count += 1
-    for sid in CURRENCY_BASKETS[currency]:
-        if sid not in components:
-            missing_count += 1
+    missing_count = sum(1 for sid in CURRENCY_BASKETS[currency] if sid not in components)
     score = round(weighted_sum / weight_sum, 1) if weight_sum > 0 else 50.0
     if score >= 80:
         bias, conf = "Strong Bullish", "High"
@@ -412,131 +358,6 @@ def currency_score(currency: str, readings: List[SeriesReading]) -> MacroScoreRe
     return MacroScoreResult(score, f"{currency} {bias}", conf, components, stale_count, missing_count)
 
 
-def session_bias(score: float, session_name: str) -> str:
-    if session_name == "Asia":
-        return "Continuation only" if score >= 80 or score <= 20 else "Range / wait for London"
-    if session_name == "London":
-        return "Prefer currency strength" if score >= 60 else "Prefer currency weakness" if score <= 40 else "Two-way / structure only"
-    if session_name == "New York":
-        return "Best continuation window" if score >= 60 else "Best selloff window" if score <= 40 else "Wait for data catalyst"
-    return "Neutral"
-
-
-def pair_bias(scores: Dict[str, MacroScoreResult]) -> List[Dict[str, str]]:
-    usd = scores["USD"].score
-    eur = scores["EUR"].score
-    gbp = scores["GBP"].score
-    jpy = scores["JPY"].score
-
-    def bias_from_diff(a: float, b: float) -> str:
-        d = a - b
-        if d >= 10:
-            return "Bullish"
-        if d <= -10:
-            return "Bearish"
-        return "Neutral"
-
-    return [
-        {"Instrument": "EUR/USD", "Bias": bias_from_diff(eur, usd)},
-        {"Instrument": "GBP/USD", "Bias": bias_from_diff(gbp, usd)},
-        {"Instrument": "USD/JPY", "Bias": "Bullish" if usd >= 60 and jpy <= 60 else "Bearish" if usd <= 40 or jpy >= 60 else "Neutral"},
-        {"Instrument": "XAU/USD", "Bias": "Bearish" if usd >= 60 else "Bullish" if usd <= 40 else "Neutral"},
-        {"Instrument": "Nas100", "Bias": "Bearish" if usd >= 60 else "Bullish" if usd <= 40 else "Neutral"},
-        {"Instrument": "US30", "Bias": "Bearish" if usd >= 60 else "Bullish" if usd <= 40 else "Neutral"},
-        {"Instrument": "VIX", "Bias": "Bullish" if usd >= 60 else "Bearish" if usd <= 40 else "Neutral"},
-    ]
-
-
-def add_alerts(scores: Dict[str, MacroScoreResult]) -> None:
-    alerts: List[str] = []
-    if scores["USD"].score >= 80:
-        alerts.append("Strong bullish USD regime detected.")
-    elif scores["USD"].score <= 20:
-        alerts.append("Strong bearish USD regime detected.")
-    for c in ["EUR", "GBP", "JPY"]:
-        if scores[c].stale_count > 0:
-            alerts.append(f"{c} basket is using stale cache for one or more series.")
-        if scores[c].missing_count > 0:
-            alerts.append(f"{c} basket has missing series.")
-    st.session_state.alerts = alerts
-
-
-def save_daily_snapshot(scores: Dict[str, MacroScoreResult]) -> None:
-    today = datetime.now(timezone.utc).date().isoformat()
-    if st.session_state.last_snapshot_date != today:
-        st.session_state.historical_scores.append(
-            {"date": today, "USD": scores["USD"].score, "JPY": scores["JPY"].score, "GBP": scores["GBP"].score, "EUR": scores["EUR"].score}
-        )
-        st.session_state.last_snapshot_date = today
-    save_snapshot(scores)
-
-
-def build_historical_score_frame() -> pd.DataFrame:
-    data = st.session_state.get("historical_scores", [])
-    if not data:
-        return load_snapshots().rename(columns={"snapshot_date": "date", "usd": "USD", "jpy": "JPY", "gbp": "GBP", "eur": "EUR"})
-    return pd.DataFrame(data)
-
-
-def is_admin() -> bool:
-    return bool(st.session_state.admin_unlocked)
-
-
-def render_admin_panel() -> None:
-    with st.expander("Admin Panel", expanded=False):
-        if is_admin():
-            st.success("Admin unlocked.")
-            if st.button("Lock Admin"):
-                st.session_state.admin_unlocked = False
-                st.rerun()
-            if st.button("Clear trade logs"):
-                st.session_state.trade_logs = []
-                st.success("Trade logs cleared.")
-            if st.button("Reset historical snapshots"):
-                st.session_state.historical_scores = []
-                st.session_state.last_snapshot_date = None
-                st.success("Snapshots cleared.")
-            if st.button("Clear request log"):
-                conn = get_db()
-                try:
-                    conn.execute("DELETE FROM request_log")
-                    conn.commit()
-                finally:
-                    conn.close()
-                st.success("Request log cleared.")
-            return
-        pwd = st.text_input("Admin password", type="password")
-        if st.button("Unlock Admin"):
-            if authenticate_admin(pwd):
-                st.session_state.admin_unlocked = True
-                st.success("Admin unlocked.")
-            else:
-                st.error("Invalid admin password.")
-
-
-def log_trade() -> None:
-    with st.form("trade_log_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            instrument = st.text_input("Instrument", value="EUR/USD")
-            direction = st.selectbox("Direction", ["Long", "Short"])
-            entry = st.text_input("Entry", value="")
-        with c2:
-            stop = st.text_input("Stop", value="")
-            target = st.text_input("Target", value="")
-            notes = st.text_input("Notes", value="")
-        if st.form_submit_button("Add Log"):
-            st.session_state.trade_logs.append(
-                {"time": utc_now(), "instrument": instrument, "direction": direction, "entry": entry, "stop": stop, "target": target, "notes": notes}
-            )
-            st.success("Trade log added.")
-
-
-def weight_controls() -> Dict[str, float]:
-    st.sidebar.header("Weights")
-    return {sid: st.sidebar.slider(SERIES_MAP[sid], 0.0, 0.5, float(default), 0.01) for sid, default in DEFAULT_WEIGHTS.items()}
-
-
 def render_divergence_chart(hist_df: pd.DataFrame) -> None:
     if hist_df.empty:
         st.info("No historical snapshots yet.")
@@ -545,101 +366,89 @@ def render_divergence_chart(hist_df: pd.DataFrame) -> None:
     chart_df["date"] = pd.to_datetime(chart_df["date"])
     chart_df = chart_df.sort_values("date").set_index("date")
     divergence = pd.DataFrame(index=chart_df.index)
-    divergence["USD-JPY"] = chart_df["USD"] - chart_df["JPY"]
     divergence["USD-EUR"] = chart_df["USD"] - chart_df["EUR"]
     divergence["USD-GBP"] = chart_df["USD"] - chart_df["GBP"]
-    st.line_chart(divergence, use_container_width=True)
+    divergence["USD-JPY"] = chart_df["USD"] - chart_df["JPY"]
+    st.line_chart(divergence, width="stretch")
 
 
 def main() -> None:
     st.set_page_config(page_title="Multi-Currency Macro Dashboard", layout="wide")
     init_state()
     init_db()
-    st.title("Multi-Currency Macro Dashboard")
 
     api_key = os.getenv("FRED_API_KEY", "")
     if not api_key:
         st.error("FRED_API_KEY is missing from environment variables.")
         return
 
-    weight_controls()
-    render_admin_panel()
+    st.title("Multi-Currency Macro Dashboard")
+
+    with st.sidebar:
+        st.header("Weights")
+        for sid, default in DEFAULT_WEIGHTS.items():
+            st.slider(SERIES_MAP[sid], 0.0, 0.5, float(default), 0.01)
+
+    with st.expander("Admin Panel", expanded=False):
+        if st.session_state.admin_unlocked:
+            st.success("Admin unlocked.")
+            if st.button("Lock Admin"):
+                st.session_state.admin_unlocked = False
+                st.rerun()
+        else:
+            pwd = st.text_input("Admin password", type="password")
+            if st.button("Unlock Admin"):
+                if authenticate_admin(pwd):
+                    st.session_state.admin_unlocked = True
+                    st.success("Admin unlocked.")
+                    st.rerun()
+                else:
+                    st.error("Invalid admin password.")
 
     baskets = {k: fetch_basket(v, api_key) for k, v in CURRENCY_BASKETS.items()}
     scores = {k: currency_score(k, baskets[k]) for k in CURRENCY_BASKETS}
-    save_daily_snapshot(scores)
-    add_alerts(scores)
+    save_snapshot(scores)
 
-    tab_overview, tab_table, tab_sessions, tab_trend, tab_logs, tab_usage = st.tabs(
-        ["Overview", "Macro Table", "Session Bias", "Trend", "Trade Logs", "API Usage"]
-    )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("USD Score", f"{scores['USD'].score:.1f}")
+    c2.metric("JPY Score", f"{scores['JPY'].score:.1f}")
+    c3.metric("GBP Score", f"{scores['GBP'].score:.1f}")
+    c4.metric("EUR Score", f"{scores['EUR'].score:.1f}")
 
-    with tab_overview:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("USD Score", f"{scores['USD'].score:.1f}")
-        c2.metric("JPY Score", f"{scores['JPY'].score:.1f}")
-        c3.metric("GBP Score", f"{scores['GBP'].score:.1f}")
-        c4.metric("EUR Score", f"{scores['EUR'].score:.1f}")
-        st.subheader("Pair View")
-        st.dataframe(pd.DataFrame(pair_bias(scores)), use_container_width=True, hide_index=True)
-        for a in st.session_state.alerts:
-            st.info(a)
+    st.subheader("Historical Macro Scores")
+    hist_df = load_snapshots()
+    if hist_df.empty:
+        st.info("No historical snapshots yet.")
+    else:
+        chart_df = hist_df.copy()
+        chart_df["date"] = pd.to_datetime(chart_df["date"])
+        chart_df = chart_df.sort_values("date").set_index("date")
+        st.line_chart(chart_df[["USD", "JPY", "GBP", "EUR"]], width="stretch")
+        st.subheader("Divergence")
+        render_divergence_chart(hist_df)
 
-    with tab_table:
-        all_readings = baskets["USD"] + baskets["JPY"] + baskets["GBP"] + baskets["EUR"]
-        rows = []
-        for r in all_readings:
-            rows.append(
+    st.subheader("Basket Status")
+    status_rows = []
+    for currency, readings in baskets.items():
+        for r in readings:
+            status_rows.append(
                 {
+                    "Currency": currency,
                     "Series": r.name,
                     "ID": r.series_id,
-                    "Current": None if r.current is None else round(r.current, 4),
-                    "Previous": None if r.previous is None else round(r.previous, 4),
-                    "Change": None if r.change is None else round(r.change, 4),
-                    "Percent Change": None if r.pct_change is None else round(r.pct_change, 2),
+                    "Current": r.current,
+                    "Previous": r.previous,
+                    "Change": r.change,
+                    "Percent Change": r.pct_change,
                     "Trend": r.trend,
                     "Last Update": r.last_update,
                     "Stale": r.stale,
                 }
             )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    with tab_sessions:
-        st.info(f"Asia: {session_bias(scores['USD'].score, 'Asia')}")
-        st.info(f"London: {session_bias(scores['USD'].score, 'London')}")
-        st.info(f"New York: {session_bias(scores['USD'].score, 'New York')}")
-        st.subheader("Currency Regime")
-        st.dataframe(pd.DataFrame([{"Currency": k, "Score": v.score, "Bias": v.bias, "Confidence": v.confidence, "Stale": v.stale_count, "Missing": v.missing_count} for k, v in scores.items()]), use_container_width=True, hide_index=True)
-
-    with tab_trend:
-        hist_df = build_historical_score_frame()
-        st.subheader("Historical Macro Scores")
-        if hist_df.empty:
-            st.info("No historical snapshots yet.")
-        else:
-            chart_df = hist_df.copy()
-            chart_df["date"] = pd.to_datetime(chart_df["date"])
-            chart_df = chart_df.sort_values("date").set_index("date")
-            st.line_chart(chart_df[["USD", "JPY", "GBP", "EUR"]], use_container_width=True)
-            st.subheader("Divergence")
-            render_divergence_chart(chart_df.reset_index())
-
-    with tab_logs:
-        st.subheader("Trade Management Log")
-        log_trade()
-        if st.session_state.trade_logs:
-            st.dataframe(pd.DataFrame(st.session_state.trade_logs), use_container_width=True, hide_index=True)
-        else:
-            st.info("No trade logs yet.")
-
-    with tab_usage:
-        conn = get_db()
-        try:
-            rows = conn.execute("SELECT ts, series_id, status_code, source, retries, success FROM request_log ORDER BY id DESC LIMIT 200").fetchall()
-            st.dataframe(pd.DataFrame([dict(r) for r in rows]), use_container_width=True, hide_index=True)
-        finally:
-            conn.close()
-
+    if status_rows:
+        st.dataframe(pd.DataFrame(status_rows), width="stretch", hide_index=True)
+    else:
+        st.info("No series loaded.")
 
 if __name__ == "__main__":
     main()

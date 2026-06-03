@@ -151,7 +151,10 @@ def init_db() -> None:
 def log_request(series_id: str, status_code: Optional[int], source: str, retries: int, success: bool) -> None:
     conn = get_db()
     try:
-        conn.execute("INSERT INTO request_log (ts, series_id, status_code, source, retries, success) VALUES (?, ?, ?, ?, ?, ?)", (utc_now(), series_id, status_code, source, retries, 1 if success else 0))
+        conn.execute(
+            "INSERT INTO request_log (ts, series_id, status_code, source, retries, success) VALUES (?, ?, ?, ?, ?, ?)",
+            (utc_now(), series_id, status_code, source, retries, 1 if success else 0),
+        )
         conn.commit()
     finally:
         conn.close()

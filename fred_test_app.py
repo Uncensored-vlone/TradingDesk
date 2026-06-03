@@ -1,5 +1,4 @@
 import os
-from functools import lru_cache
 
 import requests
 import pandas as pd
@@ -18,10 +17,10 @@ SERIES_MAP = {
 }
 
 
-@lru_cache(maxsize=64)
+@st.cache_data(ttl=3600)
 def get_fred_series(series_id: str):
     if not FRED_API_KEY:
-        raise RuntimeError("FRED_API_KEY is missing from environment variables")
+        raise RuntimeError("FRED_API_KEY is missing")
 
     params = {
         "series_id": series_id,
@@ -32,8 +31,14 @@ def get_fred_series(series_id: str):
     response = requests.get(
         FRED_BASE_URL,
         params=params,
+        headers={"User-Agent": "TradingDesk/1.0"},
         timeout=20,
     )
+
+    if response.status_code == 429:
+        raise RuntimeError(
+            "FRED rate limit reached. Please try again later."
+        )
 
     response.raise_for_status()
     return response.json()
@@ -97,9 +102,6 @@ def main():
 
     if not FRED_API_KEY:
         st.error("FRED_API_KEY is missing from environment variables")
-        st.info(
-            "Set the environment variable before launching Streamlit."
-        )
         return
 
     ok, msg = test_fred_connection()
@@ -120,23 +122,23 @@ def main():
             rows.append({
                 "Series": name,
                 "ID": sid,
-                "Date": info["date"].date() if info else "",
-                "Value": info["value"] if info else "",
+                "Date": str(info["date"].date()) if info else None,
+                "Value": float(info["value"]) if info else None,
             })
 
-        except Exception as e:
+        except Exception:
             rows.append({
                 "Series": name,
                 "ID": sid,
-                "Date": "",
-                "Value": f"Error: {e}",
+                "Date": None,
+                "Value": None,
             })
 
     df_display = pd.DataFrame(rows)
 
     st.dataframe(
         df_display,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
